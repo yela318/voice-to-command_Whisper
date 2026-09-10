@@ -20,14 +20,19 @@ from typing import TYPE_CHECKING, Union
 if TYPE_CHECKING:
     import numpy as np
 
-# faster-whisper model size. Must be multilingual (no ".en"). "tiny"/"base"
-# mis-hear Korean; "small" is the practical floor, "medium"/"large-v3" cost more
-# for marginal gains on short commands. Override with V2C_MODEL.
-MODEL_SIZE = os.environ.get("V2C_MODEL", "small")
-DEVICE = os.environ.get("V2C_DEVICE") or "cpu"  # cpu | cuda | auto
-# None -> _load() asks CTranslate2 what this card actually supports. Set
-# V2C_COMPUTE only to force something else.
-COMPUTE = os.environ.get("V2C_COMPUTE") or None
+# faster-whisper model size. Must be multilingual: no ".en", and no "distil-*"
+# either -- those are English-only despite the name. Use "small" on a CPU-only
+# box; large-v3-turbo is the slowest option there.
+MODEL_SIZE = os.environ.get("V2C_MODEL", "large-v3-turbo")
+# GPU if there is one, CPU otherwise -- _load() resolves "auto" and also falls
+# back when a card is present but unusable. Force it with V2C_DEVICE=cuda|cpu.
+DEVICE = os.environ.get("V2C_DEVICE") or "auto"  # auto | cuda | cpu
+# int8 halves the weights so the model fits on a card shared with another
+# service. V2C_COMPUTE=auto -> _load() asks CTranslate2 what the card supports
+# and takes float16 where offered; any other value is forced through as-is.
+COMPUTE = os.environ.get("V2C_COMPUTE") or "int8"
+if COMPUTE == "auto":
+    COMPUTE = None
 # Source language. None -> whisper auto-detects per clip. Set V2C_LANG="ko" to
 # pin it for Korean-only use.
 LANG = os.environ.get("V2C_LANG") or None
@@ -90,7 +95,7 @@ def _preload_cuda_libs() -> None:
 
 
 def _load():
-    global _model, COMPUTE
+    global _model, DEVICE, COMPUTE
     if _model is None:
         if DEVICE != "cpu":
             _preload_cuda_libs()
@@ -98,8 +103,28 @@ def _load():
             from faster_whisper import WhisperModel
         except ImportError as exc:  # pragma: no cover
             raise RuntimeError("faster-whisper is required: pip install -e .") from exc
+        import ctranslate2
+
+        if DEVICE == "auto":
+            DEVICE = "cuda" if ctranslate2.get_cuda_device_count() else "cpu"
         COMPUTE = COMPUTE or _compute_type(DEVICE)
-        _model = WhisperModel(MODEL_SIZE, device=DEVICE, compute_type=COMPUTE)
+        try:
+            _model = WhisperModel(MODEL_SIZE, device=DEVICE, compute_type=COMPUTE)
+        except (RuntimeError, ValueError) as exc:
+            # A card that is there but unusable -- driver older than the CUDA
+            # runtime, missing libs, a compute type it will not take. Falling
+            # back beats refusing to start, but say so: MODEL_SIZE is picked for
+            # a GPU and is the slowest option on a CPU.
+            if DEVICE == "cpu":
+                raise
+            print("v2c: {} on cuda ({}) -> falling back to cpu; {} is slow there,"
+                  " consider V2C_MODEL=small".format(type(exc).__name__,
+                                                     str(exc).splitlines()[0][:70], MODEL_SIZE),
+                  file=sys.stderr, flush=True)
+            DEVICE = "cpu"
+            if COMPUTE not in ctranslate2.get_supported_compute_types("cpu"):
+                COMPUTE = _compute_type("cpu")
+            _model = WhisperModel(MODEL_SIZE, device=DEVICE, compute_type=COMPUTE)
     return _model
 
 

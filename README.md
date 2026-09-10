@@ -1,11 +1,9 @@
 # voice-to-command
 
 Speech → text via [faster-whisper](https://github.com/SYSTRAN/faster-whisper).
-Give it a mic recording or an audio file; get back a string. By default it
-transcribes in the language spoken — Korean stays Korean, English stays English,
-source language auto-detected — and `--translate` / `translate=True` switches it
-to whisper's `task="translate"` and emits English. Whatever consumes the string
-is wired up elsewhere.
+Give it an audio file or a mic recording, get back a string. Korean in → Korean
+out, English in → English out; the language is detected per clip. Whatever
+consumes the string is wired up elsewhere.
 
 ## Install
 
@@ -15,147 +13,84 @@ cd voice-to-command
 pip install -e .          # add .[mic] for microphone input
 ```
 
-## Use
+Defaults assume a GPU. CTranslate2 needs the **CUDA 12** runtime — CUDA 13 does
+not satisfy it:
 
 ```bash
-v2c sample/voice_kor.m4a  # a file → text on stdout (Korean in → Korean out)
-v2c --listen             # the mic (Enter to start, Enter to stop) → text
-v2c --serve              # stay resident: warm the model once, then loop
-v2c sample/voice_kor.m4a --translate   # → English instead
-v2c --serve --http       # GPU box: HTTP inference server for remote clients
-v2c <file> --server_ip HOST   # run inference on that remote server, not locally
+pip install nvidia-cublas-cu12 nvidia-cudnn-cu12
 ```
 
-`v2c <file>` and `v2c --listen` each spawn a fresh process, so they pay the
-model cold start (~5 s) every time. `v2c --serve` warms once and keeps going:
-mic push-to-talk on repeat when run in a terminal, or one audio-file path per
-line from stdin when piped (`printf 'a.m4a\nb.m4a\n' | v2c --serve`). Ctrl-C or
-EOF quits.
+## Run
 
-```python
-from voice_to_command import transcribe, record
-
-transcribe("sample/voice_kor.m4a")                  # -> "당근을 주세요."
-transcribe("sample/voice_kor.m4a", translate=True)  # -> "Please give me carrots."
-transcribe(record())                                # microphone
+```bash
+v2c sample/voice_kor.m4a   # file → text on stdout
+v2c --listen               # mic (Enter to start, Enter to stop) → text
+v2c --serve                # stay resident: load the model once, then loop
 ```
 
-For a long-running process, warm the model once at startup; every call after
-that is just infer time:
+`v2c <file>` and `v2c --listen` reload the model every time (~5 s).
+`v2c --serve` pays it once and keeps going. Same thing from Python:
 
 ```python
 from voice_to_command import transcribe, record, warmup
 
-warmup()                        # ~5 s once
-while True:
-    text = transcribe(record())  # model_load: 0.00s (cached)
-    ...                          # hand `text` to whatever comes next
+warmup()                         # load once at startup
+text = transcribe(record())      # mic
+text = transcribe("clip.m4a")    # or a file
 ```
 
-`transcribe()` accepts an audio file path (wav/m4a/mp3/… — faster-whisper
-decodes it) or 16 kHz mono float32 samples, and returns the string.
-Per-stage timing goes to stderr:
+## Change the model
 
-```
-[timing] model_load: 6.21s (cold start)   # ~0.00s (cached) on later calls
-[timing] infer: 1.83s                      # decode + VAD + translation
-[timing] total: 8.04s
+```bash
+V2C_MODEL=small v2c clip.m4a
 ```
 
-Over a remote server the server logs the full server-side breakdown per request
-— `recv` (reading the upload), then `model_load` / `infer` / `total`, then
-`request` (the whole handler) — plus the recognised sentence on its stdout. The
-**client** logs one extra `[timing] remote: <s>` for the round trip as the
-caller sees it (server-side `request` + both network legs). `V2C_TIMING=0`
-silences whichever side it is set on — set it on the client to keep all timing
-on the server.
+Default is `large-v3-turbo`. Must be multilingual — no `.en`, no `distil-*`.
+
+## Run on CPU
+
+```bash
+V2C_DEVICE=cpu V2C_MODEL=small v2c clip.m4a
+```
+
+`V2C_DEVICE` is `auto`, so this is only needed to force it: with no usable
+card — or one that fails to load — v2c falls back to CPU on its own and says
+so on stderr. Pick `small` there; turbo is the slowest option on CPU.
+
+On Windows PowerShell use `$env:V2C_DEVICE="cpu"` instead of the prefix form.
+
+## Remote GPU
+
+Run the model on the GPU box, drive it from a laptop that has none. The client
+ships audio bytes over plain HTTP and prints what comes back — no auth, so use a
+trusted LAN or an SSH tunnel.
+
+```bash
+v2c --serve --http                  # on the GPU box (0.0.0.0:8756)
+v2c clip.m4a --server_ip gpu-box    # on the laptop
+v2c --listen --server_ip gpu-box    # mic local, inference remote
+```
 
 ## Config (env vars)
 
 | var | default | |
 |---|---|---|
-| `V2C_MODEL` | `small` | faster-whisper size; multilingual only (no `.en`). `tiny`/`base` mis-hear Korean |
-| `V2C_LANG` | auto | source language. Unset = auto-detect per clip (Korean + English both fine). Set `V2C_LANG=ko` to pin it for Korean-only use |
-| `V2C_TRANSLATE` | `0` | `1` translates the speech to English (`task="translate"`); default transcribes in the spoken language. Same as `--translate` |
-| `V2C_DEVICE` | `cpu` | `cpu` \| `cuda` \| `auto` |
-| `V2C_COMPUTE` | auto | picked from what CTranslate2 reports for the device: `float16` on a card that does it efficiently, else `int8`. Set it only to force something else |
-| `V2C_MIC` | system default | which input to record from: a device index or a substring of its name (`V2C_MIC=Britz`). List them with `python -c "import sounddevice as sd; print(sd.query_devices())"` |
-| `V2C_SERVER_IP` | — | run inference on a remote `v2c --serve --http` host instead of loading the model locally (same as `--server_ip`) |
-| `V2C_SERVER_PORT` | `8756` | port for the server (both the `--serve --http` listener and the client, same as `--server_port`) |
-| `V2C_HTTP_HOST` | `0.0.0.0` | interface the `--serve --http` listener binds to |
-| `V2C_TIMING` | `1` | `0` silences the `[timing]` lines |
+| `V2C_MODEL` | `large-v3-turbo` | whisper size, or a local path |
+| `V2C_DEVICE` | `auto` | GPU if there is one, else CPU. Force with `cuda` \| `cpu` |
+| `V2C_COMPUTE` | `int8` | `auto` picks `float16` where the card offers it |
+| `V2C_LANG` | auto | `ko` pins the source language |
+| `V2C_MIC` | system default | input device index, or a substring of its name |
+| `V2C_SERVER_IP` / `V2C_SERVER_PORT` | — / `8756` | remote inference host |
+| `V2C_TIMING` | `1` | `0` silences the `[timing]` lines on stderr |
+
+## Translation
+
+Need English out instead? Add `--translate`. It mistranslates homonyms —
+`사과 주세요` comes back "Please apologize".
 
 ```bash
-V2C_DEVICE=cuda v2c --serve             # GPU
-$env:V2C_DEVICE="cuda"; v2c --serve     # same on Windows PowerShell
+v2c clip.m4a --translate
 ```
-
-CTranslate2 needs the **CUDA 12** runtime (`libcublas.so.12`, cuDNN 9) — a CUDA
-13 install does not satisfy it, the soname differs. `pip install
-nvidia-cublas-cu12 nvidia-cudnn-cu12` is enough: `_load()` preloads those wheels
-itself, so `LD_LIBRARY_PATH` does not have to be set.
-
-```bash
-conda install -c conda-forge portaudio
-export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
-V2C_DEVICE=cuda v2c --serve
-```
-
-## Remote GPU
-
-Run the model on a box that has a GPU, drive it from a laptop that does not.
-The client never loads the model — it ships the audio bytes over plain HTTP and
-prints what comes back. stdlib only, no auth: use it on a trusted LAN, or tunnel
-it over SSH.
-
-```bash
-# on the GPU box — warm once, then answer /transcribe until Ctrl-C
-V2C_DEVICE=cuda v2c --serve --http            # binds 0.0.0.0:8756
-
-# on the laptop — inference happens on gpu-box, text comes back
-v2c sample/voice_kor.m4a --server_ip gpu-box
-v2c --listen             --server_ip gpu-box  # mic is local, inference remote
-v2c --serve              --server_ip gpu-box  # resident client loop
-export V2C_SERVER_IP=gpu-box                  # or set it once and drop the flag
-```
-
-`--server_port` / `V2C_SERVER_PORT` (default `8756`) sets the port on both ends.
-Across an untrusted network, tunnel instead of exposing the port:
-`ssh -N -L 8756:localhost:8756 gpu-box`, then `--server_ip 127.0.0.1`. To keep
-the server up across reboots, wrap `v2c --serve --http` in a systemd unit.
-
-The server prints each recognised sentence to its own stdout. To consume the
-text in-process — feeding a planner, say — set `remote.on_text` and start the
-server yourself instead of via the `v2c` command:
-
-```python
-from voice_to_command import remote, serve_http
-
-remote.on_text = lambda text: planner.feed(text)   # called per utterance
-serve_http(port=8756)                              # V2C_DEVICE=cuda in the env
-```
-
-`on_text` runs inside the request handler, so push slow work to a queue if the
-client shouldn't wait for it.
-
-## Notes
-
-- **Cold start:** the first call downloads (~460 MB) and loads the model (~5 s),
-  then caches it for the process — reuse one process for repeated calls.
-- **Default is transcription:** output stays in the spoken language. `--translate`
-  (whisper's `task="translate"`) only ever produces **English**, whatever the
-  source.
-- **Mixed KO/EN:** with `V2C_LANG` unset, whisper detects the language per clip;
-  measured ko-probability stays 0.93–0.99 on the short `voice_kor_*` samples.
-- **Homonyms only bite `--translate`:** one-pass translate can't tell 사과
-  (apple / apology) apart — `사과 주세요` comes back "Please apologize" and no
-  `initial_prompt` hint fixes it. Plain transcription gets the Korean right;
-  the loss is in whisper's translation head. `voice_kor_apple.wav` is the
-  regression case.
-- `sample/` holds TTS clips: `voice_kor*` (Korean) and `voice_eng_*` (the English
-  match) for carrot / banana / lemon / pineapple / apple, plus `voice.m4a`
-  (another English one). Each `voice_kor_*` / `voice_eng_<fruit>` pair says the
-  same thing in the two languages.
 
 ## Layout
 
@@ -163,9 +98,9 @@ client shouldn't wait for it.
 src/voice_to_command/
   core.py      _load() caches the model; transcribe(path | samples) -> str
   capture.py   record() — push-to-talk mic, returns float32 samples
-  remote.py    serve_http() + transcribe_remote() — run inference on a GPU box
-  cli.py       v2c <file> | v2c --listen | v2c --serve [--http] [--server_ip …]
-sample/        TTS clips: voice_kor* / voice_eng_* pairs, voice.m4a
+  remote.py    serve_http() + transcribe_remote() — inference on a GPU box
+  cli.py       v2c <file> | --listen | --serve [--http] [--server_ip …]
+sample/        TTS clips: voice_kor* / voice_eng_* pairs
 ```
 
 MIT licensed — see [LICENSE](LICENSE).

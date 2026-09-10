@@ -11,6 +11,19 @@ pytest.importorskip("faster_whisper", reason="pip install -e .")
 pytestmark = pytest.mark.slow
 
 
+@pytest.fixture(autouse=True)
+def _cpu_tiny(monkeypatch):
+    """The shipped defaults are a GPU box's (cuda + large-v3-turbo). These tests
+    assert on the return type only, so pin them to a CPU run of the smallest
+    model -- otherwise they need a card and a 1.5 GB download."""
+    from voice_to_command import core
+
+    monkeypatch.setattr(core, "DEVICE", "cpu")
+    monkeypatch.setattr(core, "COMPUTE", "int8")
+    monkeypatch.setattr(core, "MODEL_SIZE", "tiny")
+    monkeypatch.setattr(core, "_model", None)
+
+
 def test_transcribe_samples_returns_str():
     from voice_to_command import transcribe
 
